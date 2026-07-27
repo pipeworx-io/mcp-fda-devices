@@ -1,0 +1,20 @@
+{
+  "name": "@pipeworx/mcp-fda-devices",
+  "version": "0.1.0",
+  "description": "FDA medical-device regulatory intelligence from keyless openFDA datasets.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "fda-devices"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pipeworx-io/mcp-fda-devices"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
