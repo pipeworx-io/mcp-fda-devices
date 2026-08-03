@@ -5,7 +5,11 @@ interface McpToolDefinition {
     type: 'object';
     properties: Record<string, unknown>;
     required?: string[];
+    anyOf?: Array<{ required: string[] }>;
+    oneOf?: Array<{ required: string[] }>;
+    allOf?: Array<{ required: string[] }>;
   };
+  outputSchema?: Record<string, unknown>;
 }
 
 interface McpToolExport {
@@ -141,6 +145,45 @@ const tools: McpToolExport['tools'] = [
       required: ['company', 'clearances_510k', 'pma_decisions', 'recalls', 'maude_reports', 'interpretation'],
     },
   },
+  {
+    name: 'fda_device_classification',
+    description: 'Look up FDA device classification and regulatory context by product code, device name, or regulation number. Classification describes the product-code category, not a specific product’s clearance or approval.',
+    inputSchema: { type: 'object', properties: {
+      product_code: { type: 'string' }, device: { type: 'string' }, regulation_number: { type: 'string' },
+      limit: { type: 'number', description: 'Rows (1-100, default 20).' },
+    }},
+    outputSchema: listSchema('classifications'),
+  },
+  {
+    name: 'fda_device_udi_search',
+    description: 'Search FDA GUDID/UDI records by brand, company, device identifier, or product code. A UDI record describes an identified device in GUDID; it does not establish current sales, availability, clearance, approval, or safety.',
+    inputSchema: { type: 'object', properties: {
+      query: { type: 'string', description: 'Brand or device description.' }, company: { type: 'string' },
+      primary_di: { type: 'string' }, product_code: { type: 'string' }, limit: { type: 'number' },
+    }},
+    outputSchema: listSchema('devices'),
+  },
+  {
+    name: 'fda_device_establishment_search',
+    description: 'Search FDA device registration/listing data by firm, registration number, product code, or listing number. Registration/listing does not mean FDA approval, clearance, certification, or endorsement.',
+    inputSchema: { type: 'object', properties: {
+      firm: { type: 'string' }, registration_number: { type: 'string' },
+      product_code: { type: 'string' }, listing_number: { type: 'string' }, limit: { type: 'number' },
+    }},
+    outputSchema: listSchema('establishments'),
+  },
+  {
+    name: 'fda_device_product_code_profile',
+    description: 'Build a bounded cross-dataset snapshot for one FDA product code: classification, recent 510(k)s, PMAs, recalls, and MAUDE reports. Dataset counts have different meanings; MAUDE counts are not event rates.',
+    inputSchema: { type: 'object', properties: {
+      product_code: { type: 'string' }, limit_per_dataset: { type: 'number' },
+    }, required: ['product_code'] },
+    outputSchema: { type: 'object', properties: {
+      product_code: { type: 'string' }, classifications: { type: 'object' }, clearances_510k: { type: 'object' },
+      pma_decisions: { type: 'object' }, recalls: { type: 'object' }, maude_reports: { type: 'object' },
+      interpretation: { type: 'string' },
+    }, required: ['product_code', 'classifications', 'clearances_510k', 'pma_decisions', 'recalls', 'maude_reports', 'interpretation'] },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -151,8 +194,66 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case 'fda_device_adverse_events': return searchEvents(args);
     case 'fda_device_event_counts': return countEvents(args);
     case 'fda_device_company_profile': return companyProfile(args);
+    case 'fda_device_classification': return searchClassification(args);
+    case 'fda_device_udi_search': return searchUdi(args);
+    case 'fda_device_establishment_search': return searchEstablishments(args);
+    case 'fda_device_product_code_profile': return productCodeProfile(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
+}
+
+async function searchClassification(args: Record<string, unknown>) {
+  const clauses = [
+    exactClause('product_code', stringArg(args.product_code)?.toUpperCase()),
+    textClause('device_name', stringArg(args.device)),
+    exactClause('regulation_number', stringArg(args.regulation_number)),
+  ].filter(Boolean) as string[];
+  if (!clauses.length) throw new Error('Provide product_code, device, or regulation_number.');
+  const data = await fda('classification', clauses.join('+AND+'), intArg(args.limit, 20, 1, 100));
+  return listResult('classifications', data, projectClassification);
+}
+
+async function searchUdi(args: Record<string, unknown>) {
+  const query = stringArg(args.query);
+  const clauses = [
+    query ? `(brand_name:${quote(query)}+OR+device_description:${quote(query)})` : null,
+    textClause('company_name', stringArg(args.company)),
+    exactClause('primary_di', stringArg(args.primary_di)),
+    exactClause('product_codes.code', stringArg(args.product_code)?.toUpperCase()),
+  ].filter(Boolean) as string[];
+  if (!clauses.length) throw new Error('Provide at least one UDI filter.');
+  const data = await fda('udi', clauses.join('+AND+'), intArg(args.limit, 20, 1, 100), 'publish_date:desc');
+  return listResult('devices', data, projectUdi);
+}
+
+async function searchEstablishments(args: Record<string, unknown>) {
+  const clauses = [
+    textClause('registration.name', stringArg(args.firm)),
+    exactClause('registration.registration_number', stringArg(args.registration_number)),
+    exactClause('products.product_code', stringArg(args.product_code)?.toUpperCase()),
+    exactClause('listing_number', stringArg(args.listing_number)?.toUpperCase()),
+  ].filter(Boolean) as string[];
+  if (!clauses.length) throw new Error('Provide at least one registration/listing filter.');
+  const data = await fda('registrationlisting', clauses.join('+AND+'), intArg(args.limit, 20, 1, 100));
+  return listResult('establishments', data, projectEstablishment);
+}
+
+async function productCodeProfile(args: Record<string, unknown>) {
+  const productCode = requiredString(args, 'product_code').toUpperCase();
+  if (!/^[A-Z]{3}$/.test(productCode)) throw new Error('product_code must be three letters.');
+  const limit = intArg(args.limit_per_dataset, 5, 1, 20);
+  const [classifications, clearances, pmas, recalls, events] = await Promise.all([
+    searchClassification({ product_code: productCode, limit }),
+    search510k({ product_code: productCode, limit }),
+    searchPma({ product_code: productCode, limit }),
+    searchRecalls({ product_code: productCode, limit }),
+    searchEvents({ product_code: productCode, limit }),
+  ]);
+  return {
+    product_code: productCode, classifications, clearances_510k: clearances, pma_decisions: pmas,
+    recalls, maude_reports: events,
+    interpretation: 'Classification is category context; 510(k), PMA, recall, and MAUDE rows answer different regulatory questions. MAUDE has no exposure denominator and cannot support incidence or comparative-safety conclusions.',
+  };
 }
 
 async function search510k(args: Record<string, unknown>) {
@@ -261,7 +362,11 @@ async function fda(endpoint: string, search: string, limit: number, sort?: strin
 
 function listResult(key: string, data: FdaResponse, project: (row: Record<string, any>) => unknown) {
   const rows = (data.results ?? []).map(project);
-  return { total: data.meta?.results?.total ?? rows.length, returned: rows.length, [key]: rows, source: source(key === 'clearances' ? '510k' : key === 'approvals' ? 'pma' : key === 'reports' ? 'event' : 'recall') };
+  const endpoints: Record<string, string> = {
+    clearances: '510k', approvals: 'pma', reports: 'event', recalls: 'recall',
+    classifications: 'classification', devices: 'udi', establishments: 'registrationlisting',
+  };
+  return { total: data.meta?.results?.total ?? rows.length, returned: rows.length, [key]: rows, source: source(endpoints[key] ?? key) };
 }
 
 const project510k = (r: Record<string, any>) => compact({
@@ -297,6 +402,31 @@ const projectEvent = (r: Record<string, any>) => compact({
     model_number: d.model_number, device_problem_codes: d.device_problem_code,
   })),
   patient_outcomes: (r.patient ?? []).slice(0, 5).flatMap((p: Record<string, any>) => p.sequence_number_outcome ?? []),
+});
+const projectClassification = (r: Record<string, any>) => compact({
+  product_code: r.product_code, device_name: r.device_name, device_class: r.device_class,
+  regulation_number: r.regulation_number, medical_specialty: r.medical_specialty_description,
+  review_panel: r.review_panel, review_code: r.review_code, definition: r.definition,
+  implant: r.implant_flag === 'Y', life_sustaining_or_supporting: r.life_sustain_support_flag === 'Y',
+  submission_type: r.submission_type_id, gmp_exempt: r.gmp_exempt_flag === 'Y',
+});
+const projectUdi = (r: Record<string, any>) => compact({
+  primary_di: r.primary_di, brand_name: r.brand_name, version_or_model: r.version_model_number,
+  company_name: r.company_name, device_description: r.device_description,
+  publish_date: date(r.publish_date), commercial_distribution_status: r.commercial_distribution_status,
+  product_codes: (r.product_codes ?? []).slice(0, 10).map((p: Record<string, any>) =>
+    compact({ code: p.code, name: p.name })),
+  gmdn_terms: (r.gmdn_terms ?? []).slice(0, 10).map((g: Record<string, any>) =>
+    compact({ name: g.name, definition: g.definition })),
+});
+const projectEstablishment = (r: Record<string, any>) => compact({
+  registration_number: r.registration?.registration_number,
+  firm_name: r.registration?.name, owner_operator_number: r.registration?.owner_operator_number,
+  city: r.registration?.city, state: r.registration?.state_code, country: r.registration?.iso_country_code,
+  status_code: r.registration?.status_code, initial_importer: r.registration?.initial_importer_flag === 'Y',
+  listing_number: r.listing_number,
+  products: (r.products ?? []).slice(0, 20).map((p: Record<string, any>) =>
+    compact({ product_code: p.product_code, created_date: date(p.created_date), exempt: p.exempt })),
 });
 
 function textClause(field: string, value: string | null | undefined): string | null {
