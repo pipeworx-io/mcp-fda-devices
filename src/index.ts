@@ -675,11 +675,15 @@ const listSchema = (key: string) => ({
 const tools: McpToolExport['tools'] = [
   {
     name: 'fda_device_510k_search',
-    description: 'Search FDA 510(k) premarket notifications by device, applicant, product code, K number, review panel, clearance type, decision, applicant location, or third-party review status. Covers IN VITRO DIAGNOSTIC (IVD) tests and diagnostic devices, not just implants/hardware -- includes cleared molecular, genomic and companion diagnostic tests. Clearance means FDA found substantial equivalence; it is not an FDA approval or endorsement. Unknown arguments are rejected, not ignored. The most recent decision available lags roughly 2 weeks behind FDA\'s own site (openFDA\'s publishing cadence, not ours) -- do not treat this as same-day. `total` can exceed the 100-row `limit` cap; page further rows with `skip`.',
+    description: 'Search FDA 510(k) premarket notifications by device, applicant, product code, K number, review panel, clearance type, decision, applicant location, third-party review status, or device-category text (via `indication`). Covers IN VITRO DIAGNOSTIC (IVD) tests and diagnostic devices, not just implants/hardware -- includes cleared molecular, genomic and companion diagnostic tests. Clearance means FDA found substantial equivalence; it is not an FDA approval or endorsement. `indication` is a BEST-EFFORT bridge, not a clinical-claim search: 510(k) records carry no indication/intended-use text at all, so it matches FDA\'s device CLASSIFICATION category name/definition instead (a product TYPE like "Insulin Pump", not a specific claim) and finds clearances under the matching product code(s) -- for a true clinical-indication text search (e.g. molecular/companion-diagnostic claims), use fda_device_pma_search\'s indication argument, which searches FDA\'s real approval-order narrative. Unknown arguments are rejected, not ignored. The most recent decision available lags roughly 2 weeks behind FDA\'s own site (openFDA\'s publishing cadence, not ours) -- do not treat this as same-day. `total` can exceed the 100-row `limit` cap; page further rows with `skip`.',
     inputSchema: {
       type: 'object',
       properties: {
         device: { type: 'string', description: 'Device/trade name substring.' },
+        indication: {
+          type: 'array', items: { type: 'string' },
+          description: 'One or more device-category phrases, OR\'d together, matched against FDA\'s device classification name/definition (device/classification.json) to find matching product code(s), then 510(k)s under those codes -- a category match (e.g. "Insulin Pump"), NOT a search of clinical-claim text, because 510(k) has no such field. Pass several phrasings since matching is exact-phrase against the category wording. For an actual clinical-indication/intended-use text search, use fda_device_pma_search\'s indication argument instead.',
+        },
         applicant: { type: 'string', description: 'Applicant/company substring.' },
         product_code: { type: 'string', description: 'Exact three-letter FDA product code.' },
         k_number: { type: 'string', description: 'Exact K number, e.g. K241234.' },
@@ -736,11 +740,15 @@ const tools: McpToolExport['tools'] = [
   },
   {
     name: 'fda_device_pma_search',
-    description: 'Search FDA Premarket Approval (PMA) decisions and supplements by trade/generic name, applicant, product code, or PMA number. Which diagnostic tests are FDA-approved: covers high-risk IN VITRO DIAGNOSTIC (IVD) tests approved via PMA, including companion diagnostics and molecular residual disease (MRD) / ctDNA monitoring tests (e.g. Signatera, Guardant360 CDx) -- these are FDA-approved tests, not cleared devices, so this tool (not 510(k)) is the one that finds them. Supplements may represent manufacturing or labeling changes rather than new devices.',
+    description: 'Search FDA Premarket Approval (PMA) decisions and supplements by trade/generic name, applicant, product code, PMA number, or CLINICAL INDICATION/condition text (via `indication`). Which diagnostic tests are FDA-approved: covers high-risk IN VITRO DIAGNOSTIC (IVD) tests approved via PMA, including companion diagnostics and molecular residual disease (MRD) / ctDNA monitoring tests (e.g. Signatera, Guardant360 CDx) -- these are FDA-approved tests, not cleared devices, so this tool (not 510(k)) is the one that finds them. `indication` matches free text in FDA\'s own published approval-order narrative (`ao_statement`) -- the intended-use/indication language FDA wrote when it approved the device -- so a caller who describes what a test DOES or what condition/biomarker it monitors (without knowing any brand name) can still find it; `device` only matches the trade/generic NAME field and returns nothing for a condition-only question. Supplements may represent manufacturing or labeling changes rather than new devices, so a supplement\'s own ao_statement can be a narrow procedural note (e.g. "approval of a post-approval study protocol") rather than the full clinical indication -- pass several synonymous indication phrases (FDA\'s exact wording varies by product and rarely matches a lay term) rather than one exact phrase.',
     inputSchema: {
       type: 'object',
       properties: {
         device: { type: 'string', description: 'Trade or generic device name substring.' },
+        indication: {
+          type: 'array', items: { type: 'string' },
+          description: 'One or more clinical indication / intended-use / condition phrases, OR\'d together, matched as exact phrases against the FDA approval-order narrative text (ao_statement) -- NOT the device name. Use this instead of (or with) `device` when the caller names a condition/biomarker/what-it-monitors rather than a brand, e.g. for "MRD or ctDNA monitoring in solid tumors" pass ["circulating tumor DNA","molecular residual disease","minimal residual disease","cell-free DNA","ctDNA","MRD"] -- FDA\'s actual wording varies by product (Guardant360 CDx\'s approval says "cell-free DNA (cfDNA)", never "ctDNA"), so pass several synonyms rather than one exact phrase; each phrase is matched literally (no stemming/tokenizing), so an overly narrow or misspelled phrase silently finds nothing.',
+        },
         applicant: { type: 'string', description: 'Applicant/company substring.' },
         product_code: { type: 'string', description: 'Exact FDA product code.' },
         pma_number: { type: 'string', description: 'Exact PMA number, optionally including supplement suffix.' },
@@ -946,7 +954,7 @@ async function productCodeProfile(args: Record<string, unknown>) {
 // this task's expectation that they might be missing -- both narrowed `total`
 // live. Nothing from the FDA form was left out; see the fleet-close note.
 const SEARCH_510K_ARGS = [
-  'device', 'applicant', 'product_code', 'k_number', 'from_date', 'to_date',
+  'device', 'indication', 'applicant', 'product_code', 'k_number', 'from_date', 'to_date',
   'advisory_committee', 'clearance_type', 'decision', 'applicant_country',
   'applicant_state', 'third_party_review', 'limit', 'skip',
 ] as const;
@@ -954,8 +962,26 @@ const SEARCH_510K_ARGS = [
 async function search510k(args: Record<string, unknown>) {
   checkArgs(args, SEARCH_510K_ARGS);
   const skip = intArg(args.skip, 0, 0, 25000);
+  const indication = stringArrayArg(args.indication);
+  // 510(k) records carry NO free-text indication/intended-use field at all --
+  // confirmed live 2026-09-25 (fleet #2428): a full field dump of two real
+  // 510(k) records has device_name/statement_or_summary(flag-only)/openfda
+  // classification block and nothing resembling ao_statement. The only lever
+  // is FDA's device CLASSIFICATION category text (device/classification.json
+  // device_name + definition), which describes a product TYPE, not a clinical
+  // claim -- so this is a coarser, best-effort match than fda_device_pma_search's
+  // indication argument (which searches the real approval-order narrative).
+  let productCodesFromIndication: string[] = [];
+  let indicationNote: string | undefined;
+  if (indication.length) {
+    productCodesFromIndication = await resolveProductCodesByIndication(indication);
+    if (!productCodesFromIndication.length) {
+      indicationNote = `No FDA device classification category matched ${JSON.stringify(indication)}. 510(k) records have no clinical-indication text field -- this searches FDA's classification category name/definition, which describes a device TYPE (e.g. "Insulin Pump"), not a clinical claim. If the test in question is FDA-APPROVED rather than cleared (common for high-risk molecular/companion diagnostics), try fda_device_pma_search's indication argument instead -- it searches the actual approval-order narrative text.`;
+    }
+  }
   const clauses = [
     textClause('device_name', stringArg(args.device)),
+    indication.length ? orExactClause('product_code', productCodesFromIndication) : null,
     textClause('applicant', stringArg(args.applicant)),
     exactClause('product_code', stringArg(args.product_code)?.toUpperCase()),
     exactClause('k_number', stringArg(args.k_number)?.toUpperCase()),
@@ -967,9 +993,40 @@ async function search510k(args: Record<string, unknown>) {
     exactClause('state', stringArg(args.applicant_state)?.toUpperCase()),
     thirdPartyClause(args.third_party_review),
   ].filter(Boolean) as string[];
+  if (indication.length && !productCodesFromIndication.length) {
+    // No classification category matched -- asking openFDA anyway would either
+    // 404 (clauses.length may be 0) or run an unfiltered pull of the whole
+    // 510(k) database if no other filter was given. Return the explanation
+    // instead of a plausible-looking empty OR an unrelated dump.
+    return { total: 0, returned: 0, clearances: [], source: source('510k'), indication_searched: indication, indication_note: indicationNote };
+  }
   const data = await fda('510k', clauses.join('+AND+'), intArg(args.limit, 20, 1, 100), 'decision_date:desc', undefined, skip);
   const result = listResult('clearances', data, project510k);
-  return skip ? { ...result, skip } : result;
+  return {
+    ...result,
+    ...(skip ? { skip } : {}),
+    ...(indication.length ? {
+      indication_searched: indication,
+      indication_field: 'FDA device classification category name/definition (device/classification.json) -- a category match, not a clinical-claim match',
+      matched_product_codes: productCodesFromIndication,
+    } : {}),
+  };
+}
+
+// Best-effort clinical-indication -> product-code bridge for 510(k), which has
+// no indication text of its own (see search510k comment above). Matches the
+// classification endpoint's device_name AND definition, since a device TYPE
+// name and its regulatory definition are the only category-level text FDA
+// publishes. Capped at 25 codes so a very broad phrase set can't build an
+// unbounded OR clause against the 510k endpoint.
+async function resolveProductCodesByIndication(phrases: string[]): Promise<string[]> {
+  const clause = `(${phrases.flatMap((p) => [`device_name:${quote(p)}`, `definition:${quote(p)}`]).join('+OR+')})`;
+  const data = await fda('classification', clause, 100);
+  const codes = new Set<string>();
+  for (const row of data.results ?? []) {
+    if (typeof row.product_code === 'string' && row.product_code) codes.add(row.product_code);
+  }
+  return [...codes].slice(0, 25);
 }
 
 // === 510(k) summary/review document lookup (fleet #1988) ===
@@ -1091,17 +1148,41 @@ async function verifyCdrhDoc(url: string): Promise<{ url: string; contentType: s
   }
 }
 
+const SEARCH_PMA_ARGS = [
+  'device', 'indication', 'applicant', 'product_code', 'pma_number', 'from_date', 'to_date', 'limit',
+] as const;
+
 async function searchPma(args: Record<string, unknown>) {
+  checkArgs(args, SEARCH_PMA_ARGS);
   const device = stringArg(args.device);
+  const indication = stringArrayArg(args.indication);
+  // ao_statement is FDA's own free-text approval-order narrative and the ONLY
+  // indication/intended-use text openFDA exposes on PMA -- confirmed live
+  // 2026-09-25 (fleet #2428) against Signatera CDx (P260004: "...detects
+  // circulating tumor DNA (ctDNA) molecular residual disease (MRD)...") and
+  // Guardant360 CDx (P200010: "...circulating cell-free DNA (cfDNA)...").
+  // openFDA's default multi-word search is OR-of-every-token (verified live:
+  // an unquoted 7-word oncology query matched 2,142 unrelated PMAs, including
+  // glucose monitors and cardiac stents), so each phrase is quoted for an
+  // exact-phrase match and multiple phrases are OR'd explicitly by us -- never
+  // pass an unquoted multi-word clause to this endpoint.
+  const indicationClause = indication.length
+    ? `(${indication.map((phrase) => `ao_statement:${quote(phrase)}`).join('+OR+')})`
+    : null;
   const clauses = [
     device ? `(trade_name:${quote(device)}+OR+generic_name:${quote(device)})` : null,
+    indicationClause,
     textClause('applicant', stringArg(args.applicant)),
     exactClause('product_code', stringArg(args.product_code)?.toUpperCase()),
     exactClause('pma_number', stringArg(args.pma_number)?.toUpperCase()),
     rangeClause('decision_date', args.from_date, args.to_date),
   ].filter(Boolean) as string[];
+  if (!clauses.length) throw new Error('user_error: Provide device, indication, applicant, product_code, or pma_number.');
   const data = await fda('pma', clauses.join('+AND+'), intArg(args.limit, 20, 1, 100), 'decision_date:desc');
-  return listResult('approvals', data, projectPma);
+  const result = listResult('approvals', data, projectPma);
+  return indication.length
+    ? { ...result, indication_searched: indication, indication_field: 'ao_statement (FDA approval-order narrative text)' }
+    : result;
 }
 
 async function searchRecalls(args: Record<string, unknown>) {
@@ -1268,6 +1349,13 @@ const projectPma = (r: Record<string, any>) => compact({
   decision_date: date(r.decision_date), decision_code: r.decision_code,
   product_code: r.product_code, supplement_type: r.supplement_type,
   supplement_reason: r.supplement_reason,
+  // Truncated (not omitted): this is the field `indication` searches, and a
+  // caller needs to see WHY a phrase matched -- otherwise an indication-based
+  // hit is a plausible-looking row with no visible evidence behind it. A
+  // supplement's ao_statement can be a narrow procedural note ("approval of a
+  // post-approval study protocol") rather than the clinical indication, and
+  // that distinction is only visible if the text ships.
+  approval_order_statement: truncateText(r.ao_statement, 600),
 });
 const projectRecall = (r: Record<string, any>) => compact({
   recall_number: r.product_res_number, event_number: r.res_event_number,
@@ -1335,6 +1423,9 @@ function textClause(field: string, value: string | null | undefined): string | n
 function exactClause(field: string, value: string | null | undefined): string | null {
   return value ? `${field}:${quote(value)}` : null;
 }
+function orExactClause(field: string, values: string[]): string | null {
+  return values.length ? `(${values.map((v) => `${field}:${quote(v)}`).join('+OR+')})` : null;
+}
 function thirdPartyClause(value: unknown): string | null {
   return typeof value === 'boolean' ? `third_party_flag:${quote(value ? 'Y' : 'N')}` : null;
 }
@@ -1366,6 +1457,17 @@ function requiredString(args: Record<string, unknown>, key: string): string {
 }
 function stringArg(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+// Caps at 10 phrases: openFDA's search string has a practical length limit and
+// this is a bounded OR-of-exact-phrase clause, not an open-ended query builder.
+function stringArrayArg(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+    .map((v) => v.trim()).slice(0, 10);
+}
+function truncateText(value: unknown, maxLen: number): string | undefined {
+  if (typeof value !== 'string' || !value) return undefined;
+  return value.length > maxLen ? `${value.slice(0, maxLen)}…` : value;
 }
 function intArg(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
