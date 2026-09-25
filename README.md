@@ -2,15 +2,15 @@
 
 FDA medical-device regulatory intelligence from keyless openFDA datasets.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1681+ live data sources.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `fda_device_510k_search` | Search FDA 510(k) premarket notifications by device, applicant, product code, K number, review panel, clearance type, decision, applicant location, or third-party review status. Clearance means FDA found substantial equivalence; it is not an FDA approval or endorsement. Unknown arguments are rejected, not ignored. The most recent decision available lags roughly 2 weeks behind FDA's own site (openFDA's publishing cadence, not ours) -- do not treat this as same-day. `total` can exceed the 100-row `limit` cap; page further rows with `skip`. |
+| `fda_device_510k_search` | Search FDA 510(k) premarket notifications by device, applicant, product code, K number, review panel, clearance type, decision, applicant location, or third-party review status. Covers IN VITRO DIAGNOSTIC (IVD) tests and diagnostic devices, not just implants/hardware -- includes cleared molecular, genomic and companion diagnostic tests. Clearance means FDA found substantial equivalence; it is not an FDA approval or endorsement. Unknown arguments are rejected, not ignored. The most recent decision available lags roughly 2 weeks behind FDA's own site (openFDA's publishing cadence, not ours) -- do not treat this as same-day. `total` can exceed the 100-row `limit` cap; page further rows with `skip`. |
 | `fda_device_510k_summary` | Get the FDA 510(k) summary/statement document and FDA review (decision memo) for one clearance, by K number — the actual filing, not just the "a document exists" flag from fda_device_510k_search. Shows the predicate device claimed and the testing behind the equivalence finding. Older/paper-only clearances were never digitized; that returns summary_available:false with a reason, not an error. |
-| `fda_device_pma_search` | Search FDA Premarket Approval (PMA) decisions and supplements by trade/generic name, applicant, product code, or PMA number. Supplements may represent manufacturing or labeling changes rather than new devices. |
+| `fda_device_pma_search` | Search FDA Premarket Approval (PMA) decisions and supplements by trade/generic name, applicant, product code, or PMA number. Which diagnostic tests are FDA-approved: covers high-risk IN VITRO DIAGNOSTIC (IVD) tests approved via PMA, including companion diagnostics and molecular residual disease (MRD) / ctDNA monitoring tests (e.g. Signatera, Guardant360 CDx) -- these are FDA-approved tests, not cleared devices, so this tool (not 510(k)) is the one that finds them. Supplements may represent manufacturing or labeling changes rather than new devices. |
 | `fda_device_recalls` | Search FDA medical-device recall records by firm, product, product code, K number, status, or date. A recall record describes a correction/removal action and does not by itself establish patient harm. |
 | `fda_device_adverse_events` | Search FDA MAUDE medical-device reports by manufacturer, brand/device, product code, event type, or PMA/510(k) number. MAUDE reports are unverified signals: they cannot establish causation, incidence, prevalence, or comparative safety. |
 | `fda_device_event_counts` | Aggregate MAUDE reports for a device query by event type, manufacturer, product code, or receive date. Counts reflect reporting and database artifacts—not event rates or causal risk—and must not be compared without exposure denominators. |
@@ -64,7 +64,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1679+ data sources. The
+Both URLs reach the same gateway and the same 1681+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

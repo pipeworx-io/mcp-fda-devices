@@ -675,7 +675,7 @@ const listSchema = (key: string) => ({
 const tools: McpToolExport['tools'] = [
   {
     name: 'fda_device_510k_search',
-    description: 'Search FDA 510(k) premarket notifications by device, applicant, product code, K number, review panel, clearance type, decision, applicant location, or third-party review status. Clearance means FDA found substantial equivalence; it is not an FDA approval or endorsement. Unknown arguments are rejected, not ignored. The most recent decision available lags roughly 2 weeks behind FDA\'s own site (openFDA\'s publishing cadence, not ours) -- do not treat this as same-day. `total` can exceed the 100-row `limit` cap; page further rows with `skip`.',
+    description: 'Search FDA 510(k) premarket notifications by device, applicant, product code, K number, review panel, clearance type, decision, applicant location, or third-party review status. Covers IN VITRO DIAGNOSTIC (IVD) tests and diagnostic devices, not just implants/hardware -- includes cleared molecular, genomic and companion diagnostic tests. Clearance means FDA found substantial equivalence; it is not an FDA approval or endorsement. Unknown arguments are rejected, not ignored. The most recent decision available lags roughly 2 weeks behind FDA\'s own site (openFDA\'s publishing cadence, not ours) -- do not treat this as same-day. `total` can exceed the 100-row `limit` cap; page further rows with `skip`.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -736,7 +736,7 @@ const tools: McpToolExport['tools'] = [
   },
   {
     name: 'fda_device_pma_search',
-    description: 'Search FDA Premarket Approval (PMA) decisions and supplements by trade/generic name, applicant, product code, or PMA number. Supplements may represent manufacturing or labeling changes rather than new devices.',
+    description: 'Search FDA Premarket Approval (PMA) decisions and supplements by trade/generic name, applicant, product code, or PMA number. Which diagnostic tests are FDA-approved: covers high-risk IN VITRO DIAGNOSTIC (IVD) tests approved via PMA, including companion diagnostics and molecular residual disease (MRD) / ctDNA monitoring tests (e.g. Signatera, Guardant360 CDx) -- these are FDA-approved tests, not cleared devices, so this tool (not 510(k)) is the one that finds them. Supplements may represent manufacturing or labeling changes rather than new devices.',
     inputSchema: {
       type: 'object',
       properties: {
