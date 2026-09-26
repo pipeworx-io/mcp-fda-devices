@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/fda-devices",
   "title": "Fda Devices",
   "description": "FDA medical-device regulatory intelligence from keyless openFDA datasets.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "websiteUrl": "https://pipeworx.io/packs/fda-devices",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-fda-devices",
