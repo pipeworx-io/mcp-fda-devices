@@ -670,6 +670,254 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
 /**
  * FDA medical-device regulatory intelligence from keyless openFDA datasets.
  */
@@ -710,7 +958,7 @@ const listSchema = (key: string) => ({
 const tools: McpToolExport['tools'] = [
   {
     name: 'fda_device_510k_search',
-    description: 'Search FDA 510(k) premarket notifications by device, applicant, product code, K number, review panel, clearance type, decision, applicant location, third-party review status, or device-category text (via `indication`). Covers IN VITRO DIAGNOSTIC (IVD) tests and diagnostic devices, not just implants/hardware -- includes cleared molecular, genomic and companion diagnostic tests. Clearance means FDA found substantial equivalence; it is not an FDA approval or endorsement. `indication` is a BEST-EFFORT bridge, not a clinical-claim search: 510(k) records carry no indication/intended-use text at all, so it matches FDA\'s device CLASSIFICATION category name/definition instead (a product TYPE like "Insulin Pump", not a specific claim) and finds clearances under the matching product code(s) -- for a true clinical-indication text search (e.g. molecular/companion-diagnostic claims), use fda_device_pma_search\'s indication argument, which searches FDA\'s real approval-order narrative. Unknown arguments are rejected, not ignored. The most recent decision available lags roughly 2 weeks behind FDA\'s own site (openFDA\'s publishing cadence, not ours) -- do not treat this as same-day. `total` can exceed the 100-row `limit` cap; page further rows with `skip`.',
+    description: 'Search FDA 510(k) premarket notifications by device, applicant, product code, K number, review panel, clearance type, decision, applicant location, third-party review status, or device-category text (via `indication`). Covers IN VITRO DIAGNOSTIC (IVD) tests and diagnostic devices, not just implants/hardware -- includes cleared molecular, genomic and companion diagnostic tests. Clearance means FDA found substantial equivalence; it is not an FDA approval or endorsement. ALSO covers De Novo classification requests (K numbers beginning "DEN", e.g. DEN250057) -- these are not 510(k) clearances but a separate pathway that creates a brand-new device classification when no predicate exists; pass clearance_type:"De Novo" to find only these, or k_number for one by its DEN number. A granted De Novo shows decision "Granted" and carries the new regulation_number it created. `indication` is a BEST-EFFORT bridge, not a clinical-claim search: 510(k) records carry no indication/intended-use text at all, so it matches FDA\'s device CLASSIFICATION category name/definition instead (a product TYPE like "Insulin Pump", not a specific claim) and finds clearances under the matching product code(s) -- for a true clinical-indication text search (e.g. molecular/companion-diagnostic claims), use fda_device_pma_search\'s indication argument, which searches FDA\'s real approval-order narrative. Unknown arguments are rejected, not ignored. The most recent decision available lags roughly 2 weeks behind FDA\'s own site (openFDA\'s publishing cadence, not ours) -- do not treat this as same-day. `total` can exceed the 100-row `limit` cap; page further rows with `skip`.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -721,12 +969,12 @@ const tools: McpToolExport['tools'] = [
         },
         applicant: { type: 'string', description: 'Applicant/company substring.' },
         product_code: { type: 'string', description: 'Exact three-letter FDA product code.' },
-        k_number: { type: 'string', description: 'Exact K number, e.g. K241234.' },
+        k_number: { type: 'string', description: 'Exact K number, e.g. K241234, or De Novo number, e.g. DEN250057.' },
         from_date: { type: 'string', description: 'Earliest decision date, YYYY-MM-DD.' },
         to_date: { type: 'string', description: 'Latest decision date, YYYY-MM-DD.' },
         advisory_committee: { type: 'string', description: 'FDA review panel name (exact), e.g. "Orthopedic" or "Microbiology".' },
-        clearance_type: { type: 'string', description: 'Exact clearance type: Traditional, Special, or Abbreviated.' },
-        decision: { type: 'string', description: 'Exact decision text, e.g. "Substantially Equivalent".' },
+        clearance_type: { type: 'string', description: 'Exact pathway: Traditional, Special, Abbreviated, or Dual Track for ordinary 510(k)s; "De Novo" for a De Novo classification request/grant (DEN numbers) regardless of whether FDA processed it as "Direct" or "Post-NSE" -- both come back labelled De Novo, with the FDA pathway variant in de_novo_pathway.' },
+        decision: { type: 'string', description: 'Exact decision text, e.g. "Substantially Equivalent", or "Granted" for a De Novo grant.' },
         applicant_country: { type: 'string', description: 'Applicant country, ISO 3166-1 alpha-2 code, e.g. "US" or "JP".' },
         applicant_state: { type: 'string', description: 'Applicant US state/territory code, e.g. "CA". Only populated for US applicants.' },
         third_party_review: { type: 'boolean', description: 'true to keep only 510(k)s reviewed under FDA\'s third-party review program; false to exclude them.' },
@@ -1022,8 +1270,8 @@ async function search510k(args: Record<string, unknown>) {
     exactClause('k_number', stringArg(args.k_number)?.toUpperCase()),
     rangeClause('decision_date', args.from_date, args.to_date),
     exactClause('advisory_committee_description', stringArg(args.advisory_committee)),
-    exactClause('clearance_type', stringArg(args.clearance_type)),
-    exactClause('decision_description', stringArg(args.decision)),
+    clearanceTypeClause(stringArg(args.clearance_type)),
+    decisionClause(stringArg(args.decision)),
     exactClause('country_code', stringArg(args.applicant_country)?.toUpperCase()),
     exactClause('state', stringArg(args.applicant_state)?.toUpperCase()),
     thirdPartyClause(args.third_party_review),
@@ -1369,15 +1617,53 @@ function listResult(key: string, data: FdaResponse, project: (row: Record<string
   return { total: data.meta?.results?.total ?? rows.length, returned: rows.length, [key]: rows, source: source(endpoints[key] ?? key) };
 }
 
-const project510k = (r: Record<string, any>) => compact({
-  k_number: r.k_number, device_name: r.device_name, applicant: r.applicant,
-  decision_date: date(r.decision_date), decision: r.decision_description,
-  clearance_type: r.clearance_type, product_code: r.product_code,
-  advisory_committee: r.advisory_committee_description,
-  statement_or_summary: r.statement_or_summary,
-  applicant_country: r.country_code, applicant_state: r.state,
-  third_party_review: yn(r.third_party_flag),
-});
+// openFDA's device/510k endpoint also carries De Novo classification requests
+// (K numbers beginning "DEN") -- confirmed live 2026-10-21 against DEN250057
+// (Cardiosense "PCWP Analysis Software", granted 2026-05-22) and verified
+// against FDA's own De Novo detail page, which labels the decision literally
+// "granted (DENG)". openFDA's own decision_description lookup table has no
+// text for several legacy decision_code values -- it returns the literal
+// string "Unknown" for ALL 490 DEN records (decision_code DENG) plus five
+// older 510(k) codes (SESK/SESU/SEKD/SESD/SESP) -- so passing decision_code
+// straight through decision_description silently told a caller a GRANTED
+// De Novo authorization was "Unknown", indistinguishable from "we don't know
+// the status". Each label below was confirmed against FDA's own CDRH detail
+// page for a live example of that code (pmn.cfm / denovo.cfm), not guessed.
+// clearance_type is similarly misleading for these: openFDA stores the DE NOVO
+// PROCESS VARIANT ("Direct" vs "Post-NSE") in the same field 510(k) uses for
+// Traditional/Special/Abbreviated/Dual Track -- and confirmed live, those two
+// values are used EXCLUSIVELY by DEN records (their counts under
+// k_number:DEN* exactly equal the endpoint-wide counts for "Direct" and
+// "Post-NSE"), so remapping both to "De Novo" here never reclassifies an
+// ordinary 510(k). The process variant itself is not thrown away -- it moves
+// to de_novo_pathway so "was this Direct or Post-NSE" is still answerable.
+const DECISION_CODE_LABELS: Record<string, string> = {
+  DENG: 'Granted',
+  SESK: 'Substantially Equivalent - Kit',
+  SESU: 'Substantially Equivalent - With Limitations',
+  SEKD: 'Substantially Equivalent - Kit With Drugs',
+  SESD: 'Substantially Equivalent - With Drug',
+  SESP: 'Substantially Equivalent - Postmarket Surveillance Required',
+};
+const DE_NOVO_CLEARANCE_TYPES = new Set(['Direct', 'Post-NSE']);
+
+const project510k = (r: Record<string, any>) => {
+  const isDeNovo = DE_NOVO_CLEARANCE_TYPES.has(r.clearance_type);
+  return compact({
+    k_number: r.k_number, device_name: r.device_name, applicant: r.applicant,
+    decision_date: date(r.decision_date),
+    decision: DECISION_CODE_LABELS[r.decision_code] ?? r.decision_description,
+    decision_code: r.decision_code,
+    clearance_type: isDeNovo ? 'De Novo' : r.clearance_type,
+    de_novo_pathway: isDeNovo ? r.clearance_type : undefined,
+    product_code: r.product_code,
+    regulation_number: r.openfda?.regulation_number,
+    advisory_committee: r.advisory_committee_description,
+    statement_or_summary: r.statement_or_summary,
+    applicant_country: r.country_code, applicant_state: r.state,
+    third_party_review: yn(r.third_party_flag),
+  });
+};
 const projectPma = (r: Record<string, any>) => compact({
   pma_number: r.pma_number, supplement_number: r.supplement_number,
   trade_name: r.trade_name, generic_name: r.generic_name, applicant: r.applicant,
@@ -1460,6 +1746,32 @@ function exactClause(field: string, value: string | null | undefined): string | 
 }
 function orExactClause(field: string, values: string[]): string | null {
   return values.length ? `(${values.map((v) => `${field}:${quote(v)}`).join('+OR+')})` : null;
+}
+// "De Novo" is not a value openFDA stores -- it stores the process variant
+// ("Direct" or "Post-NSE") in clearance_type, both exclusive to DEN records
+// (see the project510k comment). A caller filtering clearance_type:"De Novo"
+// means either variant, so OR them; any other value passes through unchanged
+// so Traditional/Special/Abbreviated/Dual Track keep working as before.
+function clearanceTypeClause(value: string | null): string | null {
+  if (!value) return null;
+  if (value.toLowerCase() === 'de novo') {
+    return orExactClause('clearance_type', [...DE_NOVO_CLEARANCE_TYPES]);
+  }
+  return exactClause('clearance_type', value);
+}
+// decision_description is openFDA's human text for decision_code and is
+// literally "Unknown" for several codes (see DECISION_CODE_LABELS) -- so
+// filtering decision:"Granted" against decision_description would match
+// nothing even though 490 De Novo grants exist. Translate a caller's label
+// back to its decision_code when we have one; otherwise fall through to the
+// original decision_description text filter unchanged.
+const DECISION_LABEL_TO_CODE: Record<string, string> = Object.fromEntries(
+  Object.entries(DECISION_CODE_LABELS).map(([code, label]) => [label.toLowerCase(), code]),
+);
+function decisionClause(value: string | null): string | null {
+  if (!value) return null;
+  const code = DECISION_LABEL_TO_CODE[value.toLowerCase()];
+  return code ? exactClause('decision_code', code) : exactClause('decision_description', value);
 }
 function thirdPartyClause(value: unknown): string | null {
   return typeof value === 'boolean' ? `third_party_flag:${quote(value ? 'Y' : 'N')}` : null;
