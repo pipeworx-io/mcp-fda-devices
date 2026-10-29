@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-fda-devices",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "FDA medical-device regulatory intelligence from keyless openFDA datasets.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-fda-devices": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "fda-devices"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-fda-devices.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/fda-devices",
   "pipeworx": {
-    "sourceHash": "v1-2c60f40a25ca449088c1f03acfdd6875b214e8b4a00e3fec929f56c2c93f4252",
-    "sourceCommit": "722087a9bda73f85942e8f6bbfd598544cb0d490"
+    "mode": "gateway",
+    "slug": "fda-devices",
+    "gatewaySlug": "fda-devices",
+    "sourceHash": "v1-5caf52ef5ce32c679514b698b8437eacc35557a5cfa936c851f7c4f10402adb2",
+    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
   }
 }
