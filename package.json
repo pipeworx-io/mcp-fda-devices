@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-fda-devices",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "FDA medical-device regulatory intelligence from keyless openFDA datasets.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "fda-devices",
     "gatewaySlug": "fda-devices",
-    "sourceHash": "v1-5caf52ef5ce32c679514b698b8437eacc35557a5cfa936c851f7c4f10402adb2",
-    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
+    "sourceHash": "v1-70fa7b7aa62b799088ee771d48fff4010b0494b38a90d3a795f11c1eda640d27",
+    "sourceCommit": "d35e32c1ffe988e24d391dedb35666387fd2b3d6"
   }
 }
